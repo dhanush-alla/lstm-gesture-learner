@@ -97,8 +97,8 @@ def main() -> None:
             print(f"[SYSTEM] TensorFlow {tf.__version__}  →  GPU  {name}")
         else:
             print(f"[SYSTEM] TensorFlow {tf.__version__}  →  CPU")
-    except Exception:
-        pass  # TF not installed – will fail gracefully when chosen option runs
+    except Exception as exc:
+        print(f"[SYSTEM] TensorFlow not available ({exc})")
 
     # ── Ensure runtime directories exist ──────────────────────────────────────
     from src.config import DATA_PATH, LOG_PATH, MODELS_DIR

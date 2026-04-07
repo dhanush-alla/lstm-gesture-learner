@@ -86,8 +86,9 @@ def _load_data():
     X       : np.ndarray  shape (N, SEQUENCE_LENGTH, NUM_KEYPOINT_FEATURES)
     y       : np.ndarray  one-hot encoded labels  shape (N, num_classes)
     actions : list[str]   ordered gesture class names (index == label int)
+    y_int   : np.ndarray  integer labels shape (N,)
 
-    Returns (None, None, None) if no usable data is found.
+    Returns (None, None, None, None) if no usable data is found.
     """
     if not os.path.isdir(DATA_PATH):
         print(f"[ERROR] Data directory not found: {DATA_PATH}")
@@ -115,10 +116,10 @@ def _load_data():
 
         # Sort sequence folders numerically (0, 1, …, 29)
         seq_dirs = sorted(
-            d for d in os.listdir(action_path)
-            if os.path.isdir(os.path.join(action_path, d))
+            (d for d in os.listdir(action_path)
+             if os.path.isdir(os.path.join(action_path, d))),
+            key=int,
         )
-        seq_dirs.sort(key=lambda x: int(x))
 
         skipped = 0
         for seq_dir in tqdm(seq_dirs, desc=f"  Loading '{action}'", unit="seq", leave=False):
@@ -342,7 +343,7 @@ def train_model() -> None:
 
     # ── 5. Train ─────────────────────────────────────────────────────────────
     with tf.device(device):
-        history = model.fit(  # noqa: F841  (unused – available for inspection)
+        _ = model.fit(
             X_train, y_train,
             epochs=MAX_EPOCHS,
             batch_size=BATCH_SIZE,

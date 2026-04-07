@@ -1,8 +1,8 @@
 """
 app.py  –  Sign Language Recognition  –  GUI Entry Point
 ─────────────────────────────────────────────────────────
-VS Code-inspired PyQt5 interface with four panels:
-  Home  ·  Collect Data  ·  Train Model  ·  Run Inference
+VS Code-inspired PyQt5 interface with five panels:
+  Home  ·  Collect Data  ·  Train Model  ·  Run Inference  ·  Language Recognition
 
 Run with:
   python app.py
@@ -46,7 +46,7 @@ from src.config import (
     DATA_PATH, MODEL_PATH, LABELS_PATH, MODELS_DIR,
     NUM_SEQUENCES, SEQUENCE_LENGTH, BREAK_SECONDS,
     CONFIDENCE_THRESHOLD, STABILITY_WINDOW, STABILITY_MIN_VOTES,
-    TTS_ENABLED, TTS_RATE, TRANSLATE_ENABLED, TRANSLATE_TARGET_LANG,
+    TTS_ENABLED, TTS_RATE,
     NUM_KEYPOINT_FEATURES,
     TEST_SIZE, BATCH_SIZE, MAX_EPOCHS, LEARNING_RATE, EARLY_STOP_PAT,
     setup_gpu,
@@ -707,8 +707,6 @@ class InferenceWorker(QThread):
 
         sequence     = deque(maxlen=SEQUENCE_LENGTH)
         pred_history = deque(maxlen=STABILITY_WINDOW)
-        cur_label    = ""
-        cur_conf     = 0.0
         last_spoken  = ""
 
         with mp_holistic.Holistic(
@@ -743,15 +741,9 @@ class InferenceWorker(QThread):
                     if top_prob >= thresh:
                         votes = list(pred_history).count(top_idx)
                         if votes >= STABILITY_MIN_VOTES:
-                            cur_label = top_label
-                            cur_conf  = top_prob
                             if top_label != last_spoken:
                                 last_spoken = top_label
                                 _speak(top_label)
-                    elif top_prob < thresh * 0.60:
-                        cur_label = ""
-                        cur_conf  = 0.0
-
                     # Always emit raw top prediction so UI can display it
                     self.prediction.emit(top_label, top_prob, len(sequence))
                 else:
@@ -2309,7 +2301,8 @@ def main() -> None:
     font.setStyleHint(QFont.SansSerif)
     app.setFont(font)
 
-    icon = _make_app_icon()
+    _ico_path = os.path.join(_ROOT, 'app_icon.ico')
+    icon = QIcon(_ico_path) if os.path.exists(_ico_path) else _make_app_icon()
     app.setWindowIcon(icon)
     win = MainWindow()
     win.setWindowIcon(icon)
