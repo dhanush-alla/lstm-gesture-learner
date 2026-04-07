@@ -1,0 +1,49 @@
+# ============================================================
+#  Sign Language Gesture Recognition – Python Dependencies
+# ============================================================
+#
+# PYTHON VERSION: 3.11.x  (3.10+ also works)
+#
+# GPU / CUDA NOTE (Windows):
+#   TF 2.15+ on Windows requires WSL2 for native NVIDIA GPU acceleration.
+#   Native Windows GPU is no longer supported by TensorFlow ≥ 2.11.
+#
+#   Recommended GPU stack (inside WSL2 or Linux):
+#       CUDA Toolkit : 12.x  → https://developer.nvidia.com/cuda-downloads
+#       cuDNN        : 8.9   → https://developer.nvidia.com/rdp/cudnn-archive
+#
+#   On Windows without WSL2 the framework falls back to CPU automatically.
+#   setup_gpu() in config.py will report which device is active at runtime.
+#
+# QUICK INSTALL:
+#   pip install -r requirements.txt
+# ============================================================
+
+# ── Core Deep Learning ─────────────────────────────────────────────────────────
+# tensorflow 2.15.x is pinned: it requires protobuf<5 which is the same
+# constraint as mediapipe 0.10.14.  Higher TF versions (2.16+) pull in
+# protobuf 6/7 which is incompatible with mediapipe's Solutions API.
+tensorflow==2.15.1
+
+# ── Computer Vision & Hand Tracking ───────────────────────────────────────────
+opencv-python>=4.8.0
+# mediapipe 0.10.14 is pinned: last release that ships mp.solutions.holistic
+# AND requires protobuf<5 (compatible with tensorflow 2.15.x).
+# Versions >=0.10.15 removed the Solutions API; >=0.10.20 require protobuf 6+.
+mediapipe==0.10.14
+
+# ── Data Processing & Splitting ───────────────────────────────────────────────
+numpy>=1.26.0
+scikit-learn>=1.3.0
+tqdm>=4.65.0          # progress bars for data loading and sequence recording
+ijson>=3.2.0          # streaming JSON parser (for future gesture metadata files)
+
+# ── Translation & Text-to-Speech ──────────────────────────────────────────────
+deep-translator>=1.11.4   # translate predicted gesture labels on-the-fly
+pyttsx3>=2.90             # offline text-to-speech announcement of predictions
+
+# ── GUI ───────────────────────────────────────────────────────────────────────
+PyQt5>=5.15.0             # VS Code-inspired desktop UI (app.py)
+
+# ── Plotting (used by TensorBoard internally) ─────────────────────────────────
+matplotlib>=3.7.0

@@ -1,0 +1,29 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environment ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Gesture class data (user-specific recordings) ────────────────────────────
+data/*/
+
+# ── Trained model artefacts (weights + label map are dataset-specific) ────────
+models/*.h5
+models/*.npy
+models/*.keras
+
+# ── TensorBoard / training logs ───────────────────────────────────────────────
+logs/
+
+# ── OS / editor noise ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
