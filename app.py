@@ -55,6 +55,13 @@ from src.extract_keypoints import (
     mp_holistic, mediapipe_detection, draw_styled_landmarks, extract_keypoints,
 )
 
+# ── Language recognition (ASL / ISL) ──────────────────────────────────────────
+_LANG_TASK_PATH  = os.path.join(_ROOT, 'hand_landmarker.task')
+_ASL_CLASSES     = [chr(i) for i in range(ord('A'), ord('Z') + 1)] + ['del', 'nothing', 'space']
+_ISL_CLASSES     = [chr(i) for i in range(ord('a'), ord('z') + 1)]
+_LANG_CONFIDENCE = {'asl': 0.80, 'isl': 0.80}
+_LANG_HOLD_SECS  = 1.5
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  VS Code Color Palette
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -756,6 +763,207 @@ class InferenceWorker(QThread):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Language Inference Worker  (ASL / ISL — MediaPipe HandLandmarker)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LanguageInferenceWorker(QThread):
+    frame_ready     = pyqtSignal(np.ndarray)
+    prediction      = pyqtSignal(str, float)   # (smoothed_label, confidence)
+    word_update     = pyqtSignal(str)           # current partial word
+    sentence_update = pyqtSignal(str)           # committed sentence so far
+    error           = pyqtSignal(str)
+
+    # Hand skeleton connections (MediaPipe 21-point topology)
+    _HAND_CONNS = [
+        (0,1),(1,2),(2,3),(3,4),
+        (0,5),(5,6),(6,7),(7,8),
+        (0,9),(9,10),(10,11),(11,12),
+        (0,13),(13,14),(14,15),(15,16),
+        (0,17),(17,18),(18,19),(19,20),
+        (5,9),(9,13),(13,17),
+    ]
+
+    def __init__(self, mode: str = 'asl'):
+        super().__init__()
+        self.mode            = mode
+        self._stop           = False
+        self._show_landmarks = True
+        self._action_queue: list = []
+        self._lock           = threading.Lock()
+
+    def toggle_landmarks(self) -> None:
+        self._show_landmarks = not self._show_landmarks
+
+    def push_action(self, action: str) -> None:
+        with self._lock:
+            self._action_queue.append(action)
+
+    def request_stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        import tensorflow as tf
+        from collections import Counter as _Counter
+        import mediapipe as _mp
+        from mediapipe.tasks.python.vision import (
+            HandLandmarker as _HL, HandLandmarkerOptions as _HLO,
+        )
+        from mediapipe.tasks.python import BaseOptions as _BO
+
+        if not os.path.exists(_LANG_TASK_PATH):
+            self.error.emit(
+                f"hand_landmarker.task not found at:\n{_LANG_TASK_PATH}\n"
+                "Download it from MediaPipe and place it in the project root."
+            )
+            return
+
+        model_file = os.path.join(MODELS_DIR, f'model_{self.mode}_compat.h5')
+        if not os.path.exists(model_file):
+            self.error.emit(
+                f"Pre-trained model not found: {model_file}\n"
+                "Run  python convert_models.py  once to generate the Keras-2 "
+                "compatible weights from the original .keras files."
+            )
+            return
+
+        classes = _ASL_CLASSES if self.mode == 'asl' else _ISL_CLASSES
+        thresh  = _LANG_CONFIDENCE[self.mode]
+
+        model = tf.keras.models.load_model(model_file, compile=False)
+        model(tf.zeros((1, 63), dtype=tf.float32), training=False)   # warm-up
+
+        landmarker = _HL.create_from_options(_HLO(
+            base_options=_BO(model_asset_path=_LANG_TASK_PATH),
+            num_hands=2,
+            min_hand_detection_confidence=0.1,
+            min_hand_presence_confidence=0.1,
+            min_tracking_confidence=0.1,
+        ))
+
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            self.error.emit("Cannot open webcam (device 0).")
+            landmarker.close()
+            return
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+
+        # Inference state
+        pred_buffer     = deque(maxlen=10)
+        prob_buffer     = deque(maxlen=8)
+        word_buffer: list = []
+        sentence:    list = []
+        last_pred         = None
+        last_change_t     = time.time()
+        last_committed    = None
+        token_released    = True
+
+        while not self._stop:
+            ret, frame = cap.read()
+            if not ret:
+                self.msleep(16)
+                continue
+
+            frame  = cv2.flip(frame, 1)
+            rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_img = _mp.Image(image_format=_mp.ImageFormat.SRGB, data=rgb)
+            try:
+                results = landmarker.detect(mp_img)
+            except Exception:
+                results = None
+
+            # ── 63-D wrist-normalised hand coords ────────────────────────
+            coords = None
+            if results and results.hand_landmarks:
+                lms = results.hand_landmarks[0]
+                raw = np.array([[lm.x, lm.y, lm.z] for lm in lms],
+                               dtype=np.float32).flatten()
+                raw[::3]  -= raw[0]
+                raw[1::3] -= raw[1]
+                raw[2::3] -= raw[2]
+                coords = raw
+
+            # ── Landmark overlay ──────────────────────────────────────────
+            if self._show_landmarks and results and results.hand_landmarks:
+                h_px, w_px = frame.shape[:2]
+                for hand_lms in results.hand_landmarks:
+                    pts = [(int(lm.x * w_px), int(lm.y * h_px)) for lm in hand_lms]
+                    for a, b in self._HAND_CONNS:
+                        cv2.line(frame, pts[a], pts[b], (80, 200, 120), 1)
+                    for pt in pts:
+                        cv2.circle(frame, pt, 4, (245, 117, 66), -1)
+
+            # ── Model inference ───────────────────────────────────────────
+            confidence = 0.0
+            if coords is not None:
+                probs      = model(tf.constant(coords[np.newaxis]), training=False).numpy()[0]
+                prob_buffer.append(probs)
+                avg        = np.mean(np.array(prob_buffer), axis=0)
+                top_idx    = int(np.argmax(avg))
+                confidence = float(np.max(avg))
+                pred_buffer.append(classes[top_idx] if confidence > thresh else None)
+            else:
+                prob_buffer.clear()
+                pred_buffer.append(None)
+
+            smoothed = _Counter(pred_buffer).most_common(1)[0][0] if pred_buffer else None
+            self.prediction.emit(smoothed or '', confidence)
+
+            # ── Hold-to-commit ────────────────────────────────────────────
+            now = time.time()
+            if smoothed in (None, 'nothing'):
+                token_released = True
+            if smoothed != last_pred:
+                last_pred     = smoothed
+                last_change_t = now
+            elif (smoothed is not None
+                  and smoothed not in ('nothing',)
+                  and (now - last_change_t) > _LANG_HOLD_SECS):
+                if not (smoothed == last_committed and not token_released):
+                    if smoothed == 'space':
+                        if word_buffer:
+                            sentence.append(''.join(word_buffer))
+                            word_buffer.clear()
+                    elif smoothed == 'del':
+                        if word_buffer:
+                            word_buffer.pop()
+                    else:
+                        word_buffer.append(smoothed)
+                    last_committed = smoothed
+                    token_released = False
+                    self.word_update.emit(''.join(word_buffer))
+                    self.sentence_update.emit(' '.join(sentence))
+
+            # ── Manual UI actions ─────────────────────────────────────────
+            with self._lock:
+                actions = self._action_queue[:]
+                self._action_queue.clear()
+            for action in actions:
+                if action == 'space':
+                    if word_buffer:
+                        sentence.append(''.join(word_buffer))
+                        word_buffer.clear()
+                elif action == 'del':
+                    if word_buffer:
+                        word_buffer.pop()
+                    elif sentence:
+                        word_buffer[:] = list(sentence.pop())
+                elif action == 'clear':
+                    sentence.clear()
+                    word_buffer.clear()
+                    pred_buffer.clear()
+                    prob_buffer.clear()
+                self.word_update.emit(''.join(word_buffer))
+                self.sentence_update.emit(' '.join(sentence))
+
+            self.frame_ready.emit(frame.copy())
+
+        cap.release()
+        landmarker.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Home Panel
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -777,7 +985,10 @@ class HomePanel(QWidget):
         title.setStyleSheet(f"color: {C['text_bright']}; margin-bottom: 4px;")
         root.addWidget(title)
 
-        sub = QLabel("MediaPipe Holistic  ·  TensorFlow LSTM  ·  Real-time Inference")
+        sub = QLabel(
+            "MediaPipe Holistic  ·  TensorFlow LSTM  ·  "
+            "ASL / ISL Static Recognition  ·  Real-time Inference"
+        )
         sub.setStyleSheet(f"color: {C['text_muted']}; font-size: 12px; margin-bottom: 24px;")
         root.addWidget(sub)
 
@@ -795,9 +1006,12 @@ class HomePanel(QWidget):
             ("Train Model",
              "Build and fit the 3-layer stacked LSTM network on all collected data.",
              2, C["accent_blue"]),
-            ("Run Inference",
-             "Stream your webcam in real-time and classify gestures live.",
+            ("Custom Gestures",
+             "Run real-time inference on your custom-trained LSTM gesture model.",
              3, C["accent_green"]),
+            ("Language Recognition",
+             "Recognise ASL or ISL static alphabets with a pre-trained model.",
+             4, C["accent_orange"]),
         ]
         for card_title, card_desc, page_idx, color in card_defs:
             cards_row.addWidget(self._card(card_title, card_desc, page_idx, color))
@@ -1557,6 +1771,370 @@ class InferencePanel(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Language Panel  (ASL / ISL — static alphabet recognition)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class LanguagePanel(QWidget):
+    _translate_result = pyqtSignal(str)   # thread-safe label update
+
+    def __init__(self):
+        super().__init__()
+        self._worker: LanguageInferenceWorker | None = None
+        self._mode          = 'asl'
+        self._sentence_text = ''
+        self._word_text     = ''
+        self._build()
+
+    def _build(self) -> None:
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── Camera (dominant left) ────────────────────────────────────────
+        cam_wrap = QWidget()
+        cam_wrap.setStyleSheet(f"background: {C['cam_bg']};")
+        cam_lay = QVBoxLayout(cam_wrap)
+        cam_lay.setContentsMargins(16, 16, 8, 16)
+        self.cam_view = CameraView(
+            "Webcam feed appears here.\nSelect  ASL  or  ISL  and click  ▶ Start."
+        )
+        cam_lay.addWidget(self.cam_view)
+        root.addWidget(cam_wrap, stretch=3)
+
+        # ── Sidebar ───────────────────────────────────────────────────────
+        inner = QWidget()
+        inner.setStyleSheet(f"background: {C['sidebar']};")
+        info = QVBoxLayout(inner)
+        info.setContentsMargins(20, 24, 20, 20)
+        info.setSpacing(12)
+
+        scroll = QScrollArea()
+        scroll.setWidget(inner)
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(260)
+        scroll.setMaximumWidth(320)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet(
+            f"QScrollArea {{ background: {C['sidebar']}; border: none; "
+            f"border-left: 1px solid {C['border']}; }}"
+            f"QScrollBar:vertical {{ background: {C['sidebar']}; width: 6px; }}"
+            f"QScrollBar::handle:vertical {{ background: {C['input_bg']}; border-radius: 3px; }}"
+        )
+
+        heading = QLabel("Language Recognition")
+        heading.setFont(QFont("Segoe UI", 14, QFont.DemiBold))
+        heading.setStyleSheet(f"color: {C['text_bright']};")
+        info.addWidget(heading)
+
+        hint = QLabel("Static alphabet recognition using pre-trained ASL / ISL models.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {C['text_muted']}; font-size: 12px;")
+        info.addWidget(hint)
+
+        info.addWidget(_hsep())
+
+        # ── Mode selector ─────────────────────────────────────────────────
+        info.addWidget(_section_label("Mode"))
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(8)
+        _ms = (
+            f"QPushButton {{ background: {C['input_bg']}; color: {C['text_muted']}; "
+            f"border: 1px solid {C['input_border']}; border-radius: 3px; padding: 6px 18px; }}"
+            f"QPushButton:checked {{ background: {C['nav_active']}; color: {C['text_bright']}; "
+            f"border: 1px solid {C['nav_border']}; }}"
+            f"QPushButton:hover:!checked {{ background: {C['sidebar_hover']}; color: {C['text']}; }}"
+        )
+        self._asl_btn = QPushButton("ASL")
+        self._asl_btn.setCheckable(True)
+        self._asl_btn.setChecked(True)
+        self._asl_btn.setStyleSheet(_ms)
+        self._asl_btn.clicked.connect(lambda: self._set_mode('asl'))
+        self._isl_btn = QPushButton("ISL")
+        self._isl_btn.setCheckable(True)
+        self._isl_btn.setStyleSheet(_ms)
+        self._isl_btn.clicked.connect(lambda: self._set_mode('isl'))
+        mode_row.addWidget(self._asl_btn)
+        mode_row.addWidget(self._isl_btn)
+        mode_row.addStretch()
+        info.addLayout(mode_row)
+
+        info.addWidget(_hsep())
+
+        # ── Prediction letter ─────────────────────────────────────────────
+        info.addWidget(_section_label("Prediction"))
+        self.pred_lbl = QLabel("—")
+        self.pred_lbl.setFont(QFont("Segoe UI", 52, QFont.Bold))
+        self.pred_lbl.setAlignment(Qt.AlignCenter)
+        self.pred_lbl.setFixedHeight(100)
+        self.pred_lbl.setStyleSheet(
+            f"color: {C['accent_teal']}; padding: 10px; "
+            f"background: {C['bg']}; border: 1px solid {C['border']}; border-radius: 6px;"
+        )
+        info.addWidget(self.pred_lbl)
+
+        # Confidence bar
+        info.addWidget(_section_label("Confidence"))
+        self.conf_bar = QProgressBar()
+        self.conf_bar.setMaximum(100)
+        self.conf_bar.setValue(0)
+        self.conf_bar.setFixedHeight(8)
+        info.addWidget(self.conf_bar)
+        self.conf_pct = QLabel("0 %")
+        self.conf_pct.setStyleSheet(
+            f"color: {C['text_muted']}; font-size: 12px; font-family: Consolas, monospace;"
+        )
+        info.addWidget(self.conf_pct)
+
+        info.addWidget(_hsep())
+
+        # ── Word / Sentence ───────────────────────────────────────────────
+        info.addWidget(_section_label("Current word"))
+        self.word_lbl = QLabel("")
+        self.word_lbl.setFont(QFont("Consolas", 14, QFont.Bold))
+        self.word_lbl.setWordWrap(True)
+        self.word_lbl.setMinimumHeight(36)
+        self.word_lbl.setAlignment(Qt.AlignCenter)
+        self.word_lbl.setStyleSheet(
+            f"color: {C['accent_blue']}; padding: 6px 10px; "
+            f"background: {C['bg']}; border: 1px solid {C['border']}; border-radius: 4px;"
+        )
+        info.addWidget(self.word_lbl)
+
+        info.addWidget(_section_label("Sentence"))
+        self.sentence_box = QTextEdit()
+        self.sentence_box.setReadOnly(True)
+        self.sentence_box.setFixedHeight(68)
+        self.sentence_box.setFont(QFont("Consolas", 11))
+        info.addWidget(self.sentence_box)
+
+        # Action buttons
+        action_row = QHBoxLayout()
+        action_row.setSpacing(6)
+        space_btn = QPushButton("Space")
+        space_btn.clicked.connect(lambda: self._push_action('space'))
+        del_btn = QPushButton("Del")
+        del_btn.setObjectName("danger")
+        del_btn.clicked.connect(lambda: self._push_action('del'))
+        clear_btn = QPushButton("Clear")
+        clear_btn.setObjectName("danger")
+        clear_btn.clicked.connect(lambda: self._push_action('clear'))
+        for b in (space_btn, del_btn, clear_btn):
+            b.setFixedHeight(30)
+            action_row.addWidget(b)
+        info.addLayout(action_row)
+
+        # Speak / Translate
+        util_row = QHBoxLayout()
+        util_row.setSpacing(6)
+        speak_btn = QPushButton("Speak")
+        speak_btn.clicked.connect(self._on_speak)
+        translate_btn = QPushButton("Translate")
+        translate_btn.clicked.connect(self._on_translate)
+        for b in (speak_btn, translate_btn):
+            b.setFixedHeight(30)
+            util_row.addWidget(b)
+        info.addLayout(util_row)
+
+        # Target language selector
+        lang_row = QHBoxLayout()
+        lang_row.setSpacing(8)
+        lang_lbl = QLabel("Target:")
+        lang_lbl.setStyleSheet(f"color: {C['text_muted']}; font-size: 12px;")
+        lang_row.addWidget(lang_lbl)
+        self._lang_combo = QComboBox()
+        self._lang_combo.addItems([
+            "Hindi (hi)", "Telugu (te)", "Spanish (es)", "French (fr)", "German (de)",
+        ])
+        self._lang_combo.setStyleSheet(
+            f"QComboBox {{ background: {C['input_bg']}; border: 1px solid {C['input_border']}; "
+            f"border-radius: 3px; padding: 4px 8px; color: {C['text']}; }}"
+            f"QComboBox QAbstractItemView {{ background: {C['input_bg']}; color: {C['text']}; "
+            f"selection-background-color: {C['nav_active']}; border: 1px solid {C['border']}; }}"
+        )
+        lang_row.addWidget(self._lang_combo, 1)
+        info.addLayout(lang_row)
+
+        self.translate_lbl = QLabel("")
+        self.translate_lbl.setWordWrap(True)
+        self.translate_lbl.setStyleSheet(
+            f"color: {C['accent_orange']}; font-size: 12px; font-family: Consolas, monospace;"
+        )
+        info.addWidget(self.translate_lbl)
+        self._translate_result.connect(self.translate_lbl.setText)
+
+        info.addWidget(_hsep())
+
+        # Hints
+        hold_hint = QLabel(
+            "Hold a gesture 1.5 s to commit it.\n"
+            "ASL:  space  /  del  gestures auto-trigger."
+        )
+        hold_hint.setWordWrap(True)
+        hold_hint.setStyleSheet(f"color: {C['text_muted']}; font-size: 11px;")
+        info.addWidget(hold_hint)
+
+        kb = QLabel("W  –  toggle landmarks")
+        kb.setStyleSheet(
+            f"color: {C['text_muted']}; font-size: 11px; font-family: Consolas, monospace;"
+        )
+        info.addWidget(kb)
+
+        info.addStretch()
+
+        # Start / Stop
+        self.start_btn = QPushButton("▶  Start")
+        self.start_btn.setObjectName("success")
+        self.start_btn.clicked.connect(self._on_start)
+        info.addWidget(self.start_btn)
+
+        self.stop_btn = QPushButton("■  Stop")
+        self.stop_btn.setObjectName("danger")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self._on_stop)
+        info.addWidget(self.stop_btn)
+
+        root.addWidget(scroll, stretch=0)
+
+    # ── Mode ──────────────────────────────────────────────────────────────
+
+    def _set_mode(self, mode: str) -> None:
+        if mode == self._mode:
+            return
+        self._mode = mode
+        self._asl_btn.setChecked(mode == 'asl')
+        self._isl_btn.setChecked(mode == 'isl')
+        if self._worker and self._worker.isRunning():
+            self._on_stop()
+            self._on_start()
+
+    # ── Slots ─────────────────────────────────────────────────────────────
+
+    def _on_start(self) -> None:
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        self._asl_btn.setEnabled(False)
+        self._isl_btn.setEnabled(False)
+        self.pred_lbl.setText("—")
+        self.conf_bar.setValue(0)
+        self.conf_pct.setText("0 %")
+        self._worker = LanguageInferenceWorker(self._mode)
+        self._worker.frame_ready.connect(self.cam_view.set_frame)
+        self._worker.prediction.connect(self._on_prediction)
+        self._worker.word_update.connect(self._on_word)
+        self._worker.sentence_update.connect(self._on_sentence)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+
+    def _on_stop(self) -> None:
+        if self._worker:
+            try:
+                self._worker.frame_ready.disconnect(self.cam_view.set_frame)
+            except TypeError:
+                pass
+            self._worker.request_stop()
+            self._worker.wait(3000)
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self._asl_btn.setEnabled(True)
+        self._isl_btn.setEnabled(True)
+        self.cam_view.clear_frame()
+        self.pred_lbl.setText("—")
+
+    def _on_prediction(self, label: str, conf: float) -> None:
+        pct = int(conf * 100)
+        self.conf_bar.setValue(pct)
+        self.conf_pct.setText(f"{pct} %")
+        if label and label not in ('nothing',):
+            color = (
+                C['accent_green']  if conf >= 0.90
+                else C['accent_teal'] if conf >= 0.70
+                else C['accent_orange']
+            )
+            display = label.upper() if self._mode == 'asl' else label
+            self.pred_lbl.setText(display)
+            self.pred_lbl.setStyleSheet(
+                f"color: {color}; padding: 10px; "
+                f"background: {C['bg']}; border: 1px solid {C['border']}; border-radius: 6px;"
+            )
+        else:
+            self.pred_lbl.setText("—")
+            self.pred_lbl.setStyleSheet(
+                f"color: {C['accent_teal']}; padding: 10px; "
+                f"background: {C['bg']}; border: 1px solid {C['border']}; border-radius: 6px;"
+            )
+
+    def _on_word(self, text: str) -> None:
+        self._word_text = text
+        display = text.upper() if self._mode == 'asl' else text
+        self.word_lbl.setText(display)
+
+    def _on_sentence(self, text: str) -> None:
+        self._sentence_text = text
+        display = text.upper() if self._mode == 'asl' else text
+        self.sentence_box.setText(display)
+
+    def _on_error(self, msg: str) -> None:
+        self.start_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self._asl_btn.setEnabled(True)
+        self._isl_btn.setEnabled(True)
+        self.cam_view.setText(f"✗  {msg}")
+
+    def _push_action(self, action: str) -> None:
+        if self._worker and self._worker.isRunning():
+            self._worker.push_action(action)
+
+    def _get_full_text(self) -> str:
+        parts = [self._sentence_text, self._word_text]
+        text  = ' '.join(p for p in parts if p).strip()
+        return text.upper() if self._mode == 'asl' else text
+
+    def _on_speak(self) -> None:
+        text = self._get_full_text()
+        if not text:
+            return
+        import subprocess
+        safe   = text.replace("'", "''")
+        ps_cmd = (
+            f"Add-Type -AssemblyName System.Speech; "
+            f"([System.Speech.Synthesis.SpeechSynthesizer]::new()).Speak('{safe}')"
+        )
+        threading.Thread(
+            target=lambda: subprocess.run(
+                ['powershell', '-NoProfile', '-Command', ps_cmd],
+                capture_output=True,
+            ), daemon=True
+        ).start()
+
+    def _on_translate(self) -> None:
+        text = self._get_full_text()
+        if not text:
+            return
+        lang_code = self._lang_combo.currentText().split('(')[-1].rstrip(')')
+        def _do():
+            try:
+                from deep_translator import GoogleTranslator
+                result = GoogleTranslator(source='auto', target=lang_code).translate(text)
+                self._translate_result.emit(result)
+            except ImportError:
+                self._translate_result.emit(
+                    "[deep-translator not installed — run: pip install deep-translator]"
+                )
+            except Exception as exc:
+                self._translate_result.emit(f"[Translation error: {exc}]")
+        threading.Thread(target=_do, daemon=True).start()
+
+    def toggle_landmarks(self) -> None:
+        if self._worker and self._worker.isRunning():
+            self._worker.toggle_landmarks()
+
+    def cleanup(self) -> None:
+        if self._worker and self._worker.isRunning():
+            self._worker.request_stop()
+            self._worker.wait(3000)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Main Window
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1605,10 +2183,11 @@ class MainWindow(QMainWindow):
 
         # Navigation buttons
         nav_defs = [
-            ("⌂   Home",          0),
-            ("⦿   Collect Data",  1),
-            ("⚙   Train Model",   2),
-            ("◉   Run Inference", 3),
+            ("⌂   Home",                  0),
+            ("⦿   Collect Data",           1),
+            ("⚙   Train Model",            2),
+            ("◉   Custom Gestures",        3),
+            ("⌨   Language Recognition",   4),
         ]
         self._nav_btns: list[QPushButton] = []
         for text, idx in nav_defs:
@@ -1642,10 +2221,11 @@ class MainWindow(QMainWindow):
         self._collect = CollectPanel()
         self._train   = TrainPanel()
         self._infer   = InferencePanel()
+        self._lang    = LanguagePanel()
 
         self._home.navigate.connect(self._navigate)
 
-        for panel in (self._home, self._collect, self._train, self._infer):
+        for panel in (self._home, self._collect, self._train, self._infer, self._lang):
             self._stack.addWidget(panel)
 
         outer.addWidget(self._stack, stretch=1)
@@ -1666,6 +2246,8 @@ class MainWindow(QMainWindow):
             self._collect.cleanup()
         elif prev == 3 and idx != 3:
             self._infer.cleanup()
+        elif prev == 4 and idx != 4:
+            self._lang.cleanup()
 
         # Update nav button styles
         for i, btn in enumerate(self._nav_btns):
@@ -1679,7 +2261,7 @@ class MainWindow(QMainWindow):
         if idx == 0:
             self._home.refresh_stats()
 
-        labels = ["Home", "Collect Data", "Train Model", "Run Inference"]
+        labels = ["Home", "Collect Data", "Train Model", "Custom Gestures", "Language Recognition"]
         self.statusBar().showMessage(f"  {labels[idx]}")
 
     # ── Global key handling ───────────────────────────────────────────────
@@ -1693,6 +2275,8 @@ class MainWindow(QMainWindow):
                 self._collect.toggle_landmarks()
             elif idx == 3:
                 self._infer.toggle_landmarks()
+            elif idx == 4:
+                self._lang.toggle_landmarks()
 
         elif key == Qt.Key_Space and idx == 1:
             # Only forward Space if the gesture name input doesn't have focus
@@ -1708,6 +2292,7 @@ class MainWindow(QMainWindow):
         self._collect.cleanup()
         self._train.cleanup()
         self._infer.cleanup()
+        self._lang.cleanup()
         event.accept()
 
 

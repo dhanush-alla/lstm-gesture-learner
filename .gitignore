@@ -27,3 +27,7 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# ── Temp / debug output ────────────────────────────────────────────────────────
+app_out.txt
+app_err.txt
