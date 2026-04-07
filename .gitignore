@@ -10,13 +10,15 @@ venv/
 .venv/
 env/
 
-# ── Gesture class data (user-specific recordings) ────────────────────────────
-data/*/
+# ── Gesture class data ───────────────────────────────────────────────────────
+# data/*/ is now tracked — comment this out to exclude again
+# data/*/
 
-# ── Trained model artefacts (weights + label map are dataset-specific) ────────
-models/*.h5
-models/*.npy
-models/*.keras
+# ── Trained model artefacts ─────────────────────────────────────────────────
+# model weights are now tracked — comment these out to exclude again
+# models/*.h5
+# models/*.npy
+# models/*.keras
 
 # ── TensorBoard / training logs ───────────────────────────────────────────────
 logs/
