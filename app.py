@@ -15,6 +15,18 @@ import threading
 import shutil
 from collections import deque
 
+# ── Windows taskbar icon fix ──────────────────────────────────────────────────
+# Without an explicit AppUserModelID Windows groups the app under the Python
+# interpreter and shows Python's icon in the taskbar instead of ours.
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "RSLModel.SignLanguageRecognition.1"
+        )
+    except Exception:
+        pass
+
 # ── Suppress TF noise before any TF import ────────────────────────────────────
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL",  "3")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
